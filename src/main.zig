@@ -1,7 +1,7 @@
 const std = @import("std");
 const discord = @import("./discord.zig");
 
-pub const std_options = .{
+pub const std_options = std.Options{
     .log_level = .debug,
 };
 

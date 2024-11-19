@@ -1,4 +1,5 @@
 const std = @import("std");
+const ws = @import("websocket");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.discord);
@@ -47,7 +48,37 @@ pub const Discord = struct {
         }, .response_storage = .{
             .dynamic = &body,
         } });
+        if (resp.status != std.http.Status.ok) {
+            unreachable;
+        }
 
-        log.debug("got response {x} {s}", .{ resp.status, body.items });
+        const parsed = try std.json.parseFromSlice(struct {
+            url: []const u8,
+        }, self.allocator, body.items, .{});
+        defer parsed.deinit();
+
+        const url = parsed.value.url;
+        const uri = try std.Uri.parse(url);
+
+        log.debug("parsed gateway url: {s}", .{url});
+        const tls = std.mem.eql(u8, uri.scheme, "wss");
+        // if tls, use default wss port, otherwise use default ws port
+        // const port = if (tls) 443 else 80;
+        var client = try ws.Client.init(self.allocator, .{
+            .host = uri.host.?.percent_encoded,
+            .port = 443,
+            .tls = tls,
+        });
+        defer client.deinit();
+
+        var wsHeaders = std.ArrayList(u8).init(self.allocator);
+        defer wsHeaders.deinit();
+        try wsHeaders.writer().print("Host: {s}", .{uri.host.?.percent_encoded});
+
+        try client.handshake("/", .{ .headers = wsHeaders.items });
+        log.debug("connected!", .{});
+
+        const msg = try client.read();
+        log.debug("got a message? {s}", .{msg.?.data});
     }
 };
