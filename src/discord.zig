@@ -3,7 +3,18 @@ const ws = @import("websocket");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.discord);
+const json = std.json;
+
 const discordApiRoot = "https://discord.com/api/v10";
+
+pub fn Event(comptime T: type) type {
+    return struct {
+        op: i32,
+        d: ?T,
+        s: ?i32,
+        t: ?[]const u8,
+    };
+}
 
 pub const Discord = struct {
     allocator: Allocator,
@@ -79,6 +90,23 @@ pub const Discord = struct {
         log.debug("connected!", .{});
 
         const msg = try client.read();
+
         log.debug("got a message? {s}", .{msg.?.data});
+
+        var parsedEvent = try json.parseFromSlice(json.Value, self.allocator, msg.?.data, .{});
+        defer parsedEvent.deinit();
+
+        const op = parsedEvent.value.object.get("op").?.integer;
+        if (op == 10) {
+            log.debug("got a heartbeat message", .{});
+            const payload = try json.parseFromValue(struct {
+                heartbeat_interval: u64,
+            }, self.allocator, parsedEvent.value.object.get("d").?, .{ .ignore_unknown_fields = true });
+            defer payload.deinit();
+
+            log.debug("parsed heartbeat payload: {}", .{payload});
+        } else {
+            log.debug("got an unknown message: {}", .{op});
+        }
     }
 };
