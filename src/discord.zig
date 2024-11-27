@@ -1,11 +1,21 @@
 const std = @import("std");
 const ws = @import("websocket");
+const xev = @import("xev");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.discord);
 const json = std.json;
 
 const discordApiRoot = "https://discord.com/api/v10";
+
+const OpCode = enum(u8) {
+    hello = 10,
+};
+
+fn _dummyCallback(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunError!void) xev.CallbackAction {
+    log.debug("dummy callback", .{});
+    return .disarm;
+}
 
 pub fn Event(comptime T: type) type {
     return struct {
@@ -17,34 +27,44 @@ pub fn Event(comptime T: type) type {
 }
 
 pub const Discord = struct {
+    const Self = @This();
+
     allocator: Allocator,
     token: []const u8,
     client: std.http.Client,
+    loop: xev.Loop,
+
+    _wsThread: std.Thread = undefined,
+
+    // _heartbeat_interval: u64,
 
     pub const Opts = struct {
         token: []const u8,
     };
 
-    pub fn init(allocator: Allocator, opts: Opts) !Discord {
+    pub fn init(allocator: Allocator, opts: Opts) !Self {
         const client = std.http.Client{
             .allocator = allocator,
         };
 
-        return .{ .allocator = allocator, .token = opts.token, .client = client };
+        // TODO(eac): inject me?
+        const l = try xev.Loop.init(.{});
+        return .{ .allocator = allocator, .token = opts.token, .client = client, .loop = l };
     }
 
-    pub fn deinit(self: *Discord) void {
+    pub fn deinit(self: *Self) void {
         self.client.deinit();
+        self.loop.deinit();
     }
 
-    pub fn run(self: *Discord) !void {
+    pub fn run(self: *Self) !void {
         const thread = try std.Thread.spawn(.{}, loop, .{self});
         thread.join();
     }
 
     // pub fn stop(self: *Discord) void {}
 
-    fn loop(self: *Discord) !void {
+    fn loop(self: *Self) !void {
         var authHeader = std.ArrayList(u8).init(self.allocator);
         defer authHeader.deinit();
         try authHeader.writer().print("Bot {s}", .{self.token});
@@ -72,14 +92,15 @@ pub const Discord = struct {
         const uri = try std.Uri.parse(url);
 
         log.debug("parsed gateway url: {s}", .{url});
-        const tls = std.mem.eql(u8, uri.scheme, "wss");
+        // const tls = std.mem.eql(u8, uri.scheme, "wss");
         // if tls, use default wss port, otherwise use default ws port
         // const port = if (tls) 443 else 80;
-        var client = try ws.Client.init(self.allocator, .{
-            .host = uri.host.?.percent_encoded,
-            .port = 443,
-            .tls = tls,
-        });
+        // var client = try ws.Client.init(self.allocator, .{
+        //     .host = uri.host.?.percent_encoded,
+        //     .port = 443,
+        //     .tls = tls,
+        // });
+        var client = try ws.connect(self.allocator, uri.host.?.percent_encoded, 443, .{ .tls = true });
         defer client.deinit();
 
         var wsHeaders = std.ArrayList(u8).init(self.allocator);
@@ -87,26 +108,42 @@ pub const Discord = struct {
         try wsHeaders.writer().print("Host: {s}", .{uri.host.?.percent_encoded});
 
         try client.handshake("/", .{ .headers = wsHeaders.items });
-        log.debug("connected!", .{});
 
-        const msg = try client.read();
+        self._wsThread = try client.readLoopInNewThread(self);
+        // TODO(eac): add shutdown signal handler
+        self._wsThread.join();
+    }
 
-        log.debug("got a message? {s}", .{msg.?.data});
+    pub fn handle(self: *Self, msg: ws.Message) !void {
+        log.debug("got a message? {s}", .{msg.data});
 
-        var parsedEvent = try json.parseFromSlice(json.Value, self.allocator, msg.?.data, .{});
+        var parsedEvent = try json.parseFromSlice(json.Value, self.allocator, msg.data, .{});
         defer parsedEvent.deinit();
 
-        const op = parsedEvent.value.object.get("op").?.integer;
-        if (op == 10) {
-            log.debug("got a heartbeat message", .{});
-            const payload = try json.parseFromValue(struct {
-                heartbeat_interval: u64,
-            }, self.allocator, parsedEvent.value.object.get("d").?, .{ .ignore_unknown_fields = true });
-            defer payload.deinit();
+        const op: OpCode = @enumFromInt(parsedEvent.value.object.get("op").?.integer);
+        switch (op) {
+            .hello => {
+                log.debug("got a hello message", .{});
+                const payload = try json.parseFromValue(struct {
+                    heartbeat_interval: u64,
+                }, self.allocator, parsedEvent.value.object.get("d").?, .{ .ignore_unknown_fields = true });
+                defer payload.deinit();
 
-            log.debug("parsed heartbeat payload: {}", .{payload});
-        } else {
-            log.debug("got an unknown message: {}", .{op});
+                log.debug("parsed heartbeat payload: {}", .{payload});
+
+                const w = try xev.Timer.init();
+                defer w.deinit();
+
+                var c: xev.Completion = undefined;
+                w.run(&self.loop, &c, 50, void, null, &_dummyCallback);
+                try self.loop.run(.until_done);
+                log.debug("event loop done", .{});
+            },
+            // else => {
+            //     log.debug("got an unknown message: {}", .{op});
+            // },
         }
     }
+
+    pub fn close(_: *Self) void {}
 };
