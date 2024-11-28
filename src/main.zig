@@ -12,9 +12,9 @@ pub fn main() !void {
 
     const token = try std.process.getEnvVarOwned(allocator, "TEST_DISCORD_TOKEN");
     defer allocator.free(token);
-    var client = try discord.Discord.init(allocator, .{
+    var client = try discord.init(allocator, .{
         .token = token,
     });
     defer client.deinit();
-    try client.run();
+    try client.threadEnter();
 }
