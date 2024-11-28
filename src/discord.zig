@@ -10,8 +10,12 @@ const json = std.json;
 
 const discordApiRoot = "https://discord.com/api/v10";
 
-const OpCode = enum(u8) {
+const OpCode = enum(u32) {
+    heartbeat = 1,
+    identify = 2,
+
     hello = 10,
+    _,
 };
 
 fn _dummyCallback(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunError!void) xev.CallbackAction {
@@ -21,62 +25,67 @@ fn _dummyCallback(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunE
 
 pub fn Event(comptime T: type) type {
     return struct {
-        op: i32,
+        op: u32,
         d: ?T,
-        s: ?i32,
-        t: ?[]const u8,
+        s: ?i32 = null,
+        t: ?[]const u8 = null,
     };
 }
 
+// clients
+http_client: std.http.Client,
+ws_client: ws.Client,
+
 allocator: Allocator,
 token: []const u8,
-client: std.http.Client,
+bot_token: []const u8,
 loop: xev.Loop,
 
-_wsThread: std.Thread = undefined,
-loopThread: std.Thread,
+ws_thread: std.Thread = undefined,
+loop_thread: std.Thread = undefined,
 
 heartbeat_timer: xev.Timer,
 heartbeat_timer_c: xev.Completion = .{},
 
-seq: u64,
-
-// _heartbeat_interval: u64,
+seq: ?u64 = null,
+heartbeat_interval: ?u64 = null,
 
 pub const Opts = struct {
     token: []const u8,
 };
 
-const CallbackCtx = struct {
-    self: *Self,
-};
-
 pub fn init(allocator: Allocator, opts: Opts) !Self {
-    var client = std.http.Client{
+    var http_client = std.http.Client{
         .allocator = allocator,
     };
-    errdefer client.deinit();
+    errdefer http_client.deinit();
 
     // TODO(eac): inject me?
-    const l = try xev.Loop.init(.{});
+    var l = try xev.Loop.init(.{});
     errdefer l.deinit();
 
     var timer = try xev.Timer.init();
     errdefer timer.deinit();
 
+    const bot_token = try std.mem.concat(allocator, u8, &.{ "Bot ", opts.token });
+    errdefer allocator.free(bot_token);
+
     return .{
         .allocator = allocator,
         .token = opts.token,
-        .client = client,
+        .http_client = http_client,
+        .ws_client = undefined,
         .loop = l,
         .heartbeat_timer = timer,
-        .seq = 0,
+        .bot_token = bot_token,
     };
 }
 
 pub fn deinit(self: *Self) void {
-    self.client.deinit();
+    self.http_client.deinit();
     self.loop.deinit();
+    self.heartbeat_timer.deinit();
+    self.allocator.free(self.bot_token);
 }
 
 // pub fn run(self: *Self) !void {
@@ -87,17 +96,13 @@ pub fn deinit(self: *Self) void {
 // pub fn stop(self: *Discord) void {}
 
 pub fn threadEnter(self: *Self) !void {
-    var authHeader = std.ArrayList(u8).init(self.allocator);
-    defer authHeader.deinit();
-    try authHeader.writer().print("Bot {s}", .{self.token});
-
     log.debug("in client thread", .{});
 
     var body = std.ArrayList(u8).init(self.allocator);
     defer body.deinit();
 
-    const resp = try self.client.fetch(.{ .method = .GET, .location = .{ .url = discordApiRoot ++ "/gateway" }, .headers = .{
-        .authorization = .{ .override = authHeader.items },
+    const resp = try self.http_client.fetch(.{ .method = .GET, .location = .{ .url = discordApiRoot ++ "/gateway" }, .headers = .{
+        .authorization = .{ .override = self.bot_token },
     }, .response_storage = .{
         .dynamic = &body,
     } });
@@ -122,18 +127,21 @@ pub fn threadEnter(self: *Self) !void {
     //     .port = 443,
     //     .tls = tls,
     // });
-    var client = try ws.connect(self.allocator, uri.host.?.percent_encoded, 443, .{ .tls = true });
-    defer client.deinit();
 
-    var wsHeaders = std.ArrayList(u8).init(self.allocator);
-    defer wsHeaders.deinit();
-    try wsHeaders.writer().print("Host: {s}", .{uri.host.?.percent_encoded});
+    // TODO(eac): ownership id kinda broken here, fix me
+    var ws_client = try ws.connect(self.allocator, uri.host.?.percent_encoded, 443, .{ .tls = true, .handle_close = true });
+    self.ws_client = ws_client;
+    defer ws_client.deinit();
 
-    try client.handshake("/", .{ .headers = wsHeaders.items });
+    var ws_headers = std.ArrayList(u8).init(self.allocator);
+    defer ws_headers.deinit();
+    try ws_headers.writer().print("Host: {s}", .{uri.host.?.percent_encoded});
 
-    self._wsThread = try client.readLoopInNewThread(self);
+    try ws_client.handshake("/", .{ .headers = ws_headers.items });
+
+    self.ws_thread = try ws_client.readLoopInNewThread(self);
     // TODO(eac): add shutdown signal handler
-    self._wsThread.join();
+    self.ws_thread.join();
 }
 
 pub fn handle(self: *Self, msg: ws.Message) !void {
@@ -152,25 +160,77 @@ pub fn handle(self: *Self, msg: ws.Message) !void {
             defer payload.deinit();
 
             log.debug("parsed heartbeat payload: {}", .{payload});
-            self.seq = parsedEvent.value.object.get("s").?.integer;
+            if (parsedEvent.value.object.get("s")) |v| switch (v) {
+                .integer => |i| self.seq = @intCast(i),
+                else => {},
+            };
 
-            const ctx: CallbackCtx = .{ .self = self };
-            self.heartbeat_timer.run(&self.loop, &self.heartbeat_timer_c, payload.value.heartbeat_interval, CallbackCtx, &ctx, &heartbeatCallback);
+            // TODO(eac): jitter after rand changes in 0.13
+            self.heartbeat_interval = payload.value.heartbeat_interval;
+            self.heartbeat_timer.run(&self.loop, &self.heartbeat_timer_c, self.heartbeat_interval.?, Self, self, &heartbeatCallback);
+            self.loop_thread = try std.Thread.spawn(.{}, loopThread, .{self});
+            self.loop_thread.detach();
+
+            const identify_payload: Event(struct {
+                token: []const u8,
+                intents: u64,
+                properties: struct {
+                    os: []const u8,
+                    browser: []const u8,
+                    device: []const u8,
+                },
+            }) = .{
+                .op = @intFromEnum(OpCode.identify),
+                .d = .{
+                    .token = self.bot_token,
+                    .intents = 1,
+                    .properties = .{
+                        .os = "linux",
+                        .browser = "discord_zig",
+                        .device = "discord_zig",
+                    },
+                },
+            };
+
+            const body = try json.stringifyAlloc(self.allocator, identify_payload, .{});
+            log.debug("sending identify payload: {s}", .{body});
+            defer self.allocator.free(body);
+            try self.ws_client.writeText(body);
         },
-        // else => {
-        //     log.debug("got an unknown message: {}", .{op});
-        // },
+        else => {
+            log.debug("got an unknown message: {}", .{parsedEvent.value.object});
+        },
     }
 }
 
-fn heartbeatCallback(ctx: *CallbackCtx, loop: *xev.Loop, completion: *xev.Completion, err: xev.Timer.RunError!void) xev.CallbackAction {
-    log.debug("in heartbeat callback", .{});
-    const self = ctx.self;
-
-    const payload: Event(u64) = .{
-        .op = 1,
-        .d = self.seq,
-    };
+fn loopThread(self: *Self) !void {
+    log.debug("running event loop", .{});
+    try self.loop.run(.until_done);
 }
 
-pub fn close(_: *Self) void {}
+fn heartbeatCallback(self_: ?*Self, loop: *xev.Loop, completion: *xev.Completion, err: xev.Timer.RunError!void) xev.CallbackAction {
+    const self = self_ orelse unreachable;
+    _ = loop;
+    _ = completion;
+    _ = err catch unreachable;
+
+    const payload: Event(u64) = .{
+        .op = @intFromEnum(OpCode.heartbeat),
+        .d = self.seq,
+    };
+
+    log.debug("heartbeat payload: {any}", .{payload});
+    const body = json.stringifyAlloc(self.allocator, payload, .{}) catch unreachable;
+    defer self.allocator.free(body);
+    self.ws_client.writeText(body) catch unreachable;
+
+    // enqueue next heartbeat
+    self.heartbeat_timer.run(&self.loop, &self.heartbeat_timer_c, self.heartbeat_interval.?, Self, self, &heartbeatCallback);
+
+    return .disarm;
+}
+
+pub fn close(_: *Self) void {
+    log.debug("websocket connection closed", .{});
+    unreachable;
+}
