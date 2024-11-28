@@ -39,10 +39,16 @@ loopThread: std.Thread,
 heartbeat_timer: xev.Timer,
 heartbeat_timer_c: xev.Completion = .{},
 
+seq: u64,
+
 // _heartbeat_interval: u64,
 
 pub const Opts = struct {
     token: []const u8,
+};
+
+const CallbackCtx = struct {
+    self: *Self,
 };
 
 pub fn init(allocator: Allocator, opts: Opts) !Self {
@@ -64,6 +70,7 @@ pub fn init(allocator: Allocator, opts: Opts) !Self {
         .client = client,
         .loop = l,
         .heartbeat_timer = timer,
+        .seq = 0,
     };
 }
 
@@ -145,13 +152,25 @@ pub fn handle(self: *Self, msg: ws.Message) !void {
             defer payload.deinit();
 
             log.debug("parsed heartbeat payload: {}", .{payload});
+            self.seq = parsedEvent.value.object.get("s").?.integer;
 
-            self.heartbeat_timer.run(&self.loop, &self.heartbeat_timer_c, payload.value.heartbeat_interval, void, null, &_dummyCallback);
+            const ctx: CallbackCtx = .{ .self = self };
+            self.heartbeat_timer.run(&self.loop, &self.heartbeat_timer_c, payload.value.heartbeat_interval, CallbackCtx, &ctx, &heartbeatCallback);
         },
         // else => {
         //     log.debug("got an unknown message: {}", .{op});
         // },
     }
+}
+
+fn heartbeatCallback(ctx: *CallbackCtx, loop: *xev.Loop, completion: *xev.Completion, err: xev.Timer.RunError!void) xev.CallbackAction {
+    log.debug("in heartbeat callback", .{});
+    const self = ctx.self;
+
+    const payload: Event(u64) = .{
+        .op = 1,
+        .d = self.seq,
+    };
 }
 
 pub fn close(_: *Self) void {}
